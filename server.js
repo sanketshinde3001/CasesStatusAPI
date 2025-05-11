@@ -248,12 +248,13 @@ function calculateTimeTaken(startTime) {
     return (endTime[0] * 1000 + endTime[1] / 1000000).toFixed(2);
 }
 
-const server = app.listen(PORT, () => {
-    console.log(`Case Details API Server running on http://localhost:${PORT}`);
-    if (!GEMINI_API_KEY) { // Double check, critical for operation
+const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Case Details API Server running on http://0.0.0.0:${PORT}`);
+    if (!GEMINI_API_KEY) {
         console.warn("CRITICAL_WARNING: GOOGLE_API_KEY is NOT SET. The API will not function as expected.");
     }
 });
+
 
 // Graceful shutdown handler
 function gracefulShutdown(signal) {
