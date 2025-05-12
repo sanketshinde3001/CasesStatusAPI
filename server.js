@@ -248,7 +248,21 @@ function calculateTimeTaken(startTime) {
     return (endTime[0] * 1000 + endTime[1] / 1000000).toFixed(2);
 }
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Case Details API Server running on http://0.0.0.0:${PORT}`);
+const server = app.listen(PORT, () => {
+    console.log(`Case Details API Server running on http://localhost:${PORT}`);
+    if (!GEMINI_API_KEY) { // Double check, critical for operation
+        console.warn("CRITICAL_WARNING: GOOGLE_API_KEY is NOT SET. The API will not function as expected.");
+    }
 });
 
+// Graceful shutdown handler
+function gracefulShutdown(signal) {
+    console.log(`${signal} signal received: closing HTTP server`);
+    server.close(() => {
+        console.log('HTTP server closed.');
+        process.exit(0);
+    });
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT')); // Catches Ctrl+C
