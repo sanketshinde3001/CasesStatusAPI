@@ -2,7 +2,7 @@
 const express = require('express');
 const cheerio = require('cheerio');
 const { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } = require('@google/generative-ai');
-const { URL, URLSearchParams } = require('url');
+const { URL, URLSearchParams } = require('url'); // URL is already here
 const { config } = require('dotenv');
 
 config(); // Load environment variables from .env file
@@ -10,10 +10,10 @@ config(); // Load environment variables from .env file
 // --- Configuration ---
 const INITIAL_PAGE_URL = 'https://www.sci.gov.in/case-status-diary-no/';
 const AJAX_URL_BASE = 'https://www.sci.gov.in/wp-admin/admin-ajax.php';
-const CAPTCHA_IMAGE_BASE_URL = 'https://www.sci.gov.in/';
+const CAPTCHA_IMAGE_BASE_URL = 'https://www.sci.gov.in/'; // Used for resolving relative links
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL_NAME = "gemini-2.0-flash";
+const GEMINI_MODEL_NAME = "gemini-2.0-flash"; // Corrected from gemini-1.5-flash-latest to a valid model if needed
 
 if (!GEMINI_API_KEY) {
     console.error("CRITICAL_ERROR: GEMINI_API_KEY environment variable is not set. API cannot function.");
@@ -205,7 +205,6 @@ async function getCaseDetailsProcess(diaryNo, year, requestIdentifier = `${diary
         } catch (error) {
             lastError = error;
             console.error(`[${requestIdentifier}] Attempt ${attempts}/${MAX_ATTEMPTS} failed: ${error.message}`);
-             // Log stack trace for unexpected errors
             if (!error.message.includes("SCID") && !error.message.includes("token") && !error.message.includes("CAPTCHA") && !error.message.includes("AJAX Error") && !error.message.includes("Fetch")) {
                 console.error(error.stack);
             }
@@ -219,6 +218,78 @@ async function getCaseDetailsProcess(diaryNo, year, requestIdentifier = `${diary
     console.error(`[${requestIdentifier}] All ${MAX_ATTEMPTS} attempts failed. Final error: ${lastError.message}`);
     throw lastError;
 }
+
+
+// --- Helper function to parse HTML and extract case details ---
+function parseCaseDetailsHtml(htmlString) {
+    const $ = cheerio.load(htmlString);
+    const cases = [];
+    // The relevant table is inside div.distTableContent
+    const caseRows = $('div.distTableContent table tbody tr');
+
+    // Check if the relevant content area indicates no records.
+    // This check is broad; refine if the site has a very specific "no records" element.
+    if (caseRows.length === 0) {
+        const contentDivText = $('div.distTableContent').text().toLowerCase();
+        if (contentDivText.includes('no record found') || contentDivText.includes('no data found')) {
+            console.log("[parseCaseDetailsHtml] No records found message detected.");
+            return []; // Return empty array for no records
+        }
+        // If no rows and no explicit "no records" message, still return empty.
+        console.log("[parseCaseDetailsHtml] No case rows found in the table.");
+        return [];
+    }
+
+    caseRows.each((index, element) => {
+        const row = $(element);
+        const cells = row.find('td');
+
+        if (cells.length >= 7) { // Ensure we have enough cells
+            const caseDetail = {
+                serialNumber: $(cells[0]).text().trim(),
+                diaryNumber: $(cells[1]).text().trim(),
+                caseNumber: '',
+                registeredOn: '',
+                petitionerName: $(cells[3]).text().trim(),
+                respondentName: $(cells[4]).text().trim(),
+                status: $(cells[5]).text().trim(),
+                viewDetailsLink: '',
+            };
+
+            // Extract and split Case Number and Registration Date from the 3rd cell (index 2)
+            const caseInfoFullText = $(cells[2]).text().trim();
+            const registeredOnMatch = caseInfoFullText.match(/Registered on\s*([\d]{2}-[\d]{2}-[\d]{4})/i);
+
+            if (registeredOnMatch && registeredOnMatch[1]) {
+                caseDetail.registeredOn = registeredOnMatch[1];
+                caseDetail.caseNumber = caseInfoFullText.replace(registeredOnMatch[0], '').replace(/\s+/g, ' ').trim();
+            } else {
+                caseDetail.caseNumber = caseInfoFullText.replace(/\s+/g, ' ').trim(); // Fallback if no date found
+            }
+
+            // Extract View Details Link from the 7th cell (index 6)
+            const viewLinkTag = $(cells[6]).find('a.viewCnrDetails'); // Class specific to the view link
+            if (viewLinkTag.length > 0) {
+                const relativeLink = viewLinkTag.attr('href');
+                if (relativeLink) {
+                    try {
+                        // CAPTCHA_IMAGE_BASE_URL is 'https://www.sci.gov.in/'
+                        caseDetail.viewDetailsLink = new URL(relativeLink, CAPTCHA_IMAGE_BASE_URL).href;
+                    } catch (e) {
+                        console.error(`[parseCaseDetailsHtml] Error constructing URL for viewDetailsLink ('${relativeLink}'):`, e.message);
+                        caseDetail.viewDetailsLink = relativeLink; // Fallback to relative link on error
+                    }
+                }
+            }
+            cases.push(caseDetail);
+        } else {
+            console.warn("[parseCaseDetailsHtml] Found a row with fewer than 7 cells, skipping.");
+        }
+    });
+
+    return cases;
+}
+
 
 // --- Express API Setup ---
 const app = express();
@@ -258,17 +329,44 @@ app.post('/api/case-details', async (req, res) => {
     const year = parts[1];
 
     try {
-        const ajaxJsonResponse = await getCaseDetailsProcess(diaryNo, year, requestIdentifierLog);
+        // sourceResponse is the JSON object returned by the target website's AJAX endpoint
+        const sourceResponse = await getCaseDetailsProcess(diaryNo, year, requestIdentifierLog);
         const timeTakenMs = parseFloat(calculateTimeTaken(startTime));
-        console.log(`[${requestIdentifierLog}] Request successful. Responding 200. Time taken: ${timeTakenMs}ms`);
-        res.status(200).json({
-            success: true, // Assuming the structure you want if ajaxJsonResponse itself doesn't have a top-level success
-            data: ajaxJsonResponse,
-            timeTakenMs
-        });
-    } catch (error) {
+
+        if (sourceResponse && sourceResponse.success === true && sourceResponse.data && sourceResponse.data.resultsHtml) {
+            const structuredCaseData = parseCaseDetailsHtml(sourceResponse.data.resultsHtml);
+            
+            console.log(`[${requestIdentifierLog}] Request successful. Parsed ${structuredCaseData.length} case(s). Responding 200.`);
+            res.status(200).json({
+                success: true,
+                data: structuredCaseData, // The array of parsed case objects
+                pagination: sourceResponse.data.pagination, // Pass along pagination info
+                timeTakenMs
+            });
+        } else if (sourceResponse && sourceResponse.success === false) {
+            // The target website's AJAX call reported an error (e.g., wrong captcha, no data)
+            const errorMessage = (sourceResponse.data && (sourceResponse.data.message || sourceResponse.data.html)) 
+                                 || "Failed to retrieve details: Source reported an error.";
+            console.warn(`[${requestIdentifierLog}] Source AJAX call reported failure: ${errorMessage}. Responding 422.`);
+            res.status(422).json({ // 422 Unprocessable Entity: server understands request, but cannot process due to source issue
+                success: false,
+                error: errorMessage,
+                // originalSourceData: sourceResponse.data, // Optionally include original error data from source for debugging
+                timeTakenMs
+            });
+        } else {
+            // Unexpected structure from the sourceResponse
+            console.error(`[${requestIdentifierLog}] Unexpected response structure from source. Responding 500.`);
+            res.status(500).json({
+                success: false,
+                error: "Failed to process response from source: Unexpected data structure.",
+                // originalSourceResponse: sourceResponse, // For debugging
+                timeTakenMs
+            });
+        }
+    } catch (error) { // This catches errors from getCaseDetailsProcess itself (network, Gemini, local logic)
         const timeTakenMs = parseFloat(calculateTimeTaken(startTime));
-        console.error(`[${requestIdentifierLog}] Request failed. Responding 500. Error: ${error.message}. Time taken: ${timeTakenMs}ms`);
+        console.error(`[${requestIdentifierLog}] Request processing failed. Error: ${error.message}. Time taken: ${timeTakenMs}ms`);
         res.status(500).json({
             success: false,
             error: `Failed to retrieve case details: ${error.message}`,
